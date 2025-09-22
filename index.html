@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Argo VPN Bridge Decoder</title>
+
+  <!-- Tailwind CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <!-- pako: zlib inflate -->
+  <script src="https://cdn.jsdelivr.net/npm/pako@2.1.0/dist/pako.min.js"></script>
+
+  <style>
+    pre { white-space: pre-wrap; word-break: break-word; }
+  </style>
+</head>
+<body class="bg-slate-50 min-h-screen text-slate-800">
+  <div class="max-w-4xl mx-auto p-6">
+    <header class="mb-6">
+      <h1 class="text-2xl font-semibold mb-1">Argo VPN Bridge Decoder</h1>
+      <p class="text-sm text-slate-600">Paste a raw Base64 string or a PEM-style bridge block. The page decodes it and generates proxy share links.</p>
+    </header>
+
+    <section class="mb-4 bg-white p-4 rounded shadow">
+      <label class="block text-sm font-medium text-slate-700 mb-2">Bridge Input</label>
+      <textarea id="inputBlob" rows="6" class="w-full rounded border p-2 text-sm" placeholder="Paste Base64 or PEM bridge here"></textarea>
+
+      <div class="flex gap-2 mt-3">
+        <button id="btnDecode" class="px-4 py-2 bg-indigo-600 text-white rounded hover:bg-indigo-700">Decode & Generate</button>
+        <button id="btnClear" class="px-4 py-2 bg-red-50 text-red-700 rounded border">Clear</button>
+      </div>
+    </section>
+
+    <section class="mb-4 grid grid-cols-1 md:grid-cols-2 gap-4">
+      <div class="bg-white p-4 rounded shadow">
+        <h2 class="font-medium mb-2">Decoded Outer JSON</h2>
+        <pre id="outerJson" class="text-xs text-slate-700 h-40 overflow-auto p-2 bg-slate-50 rounded"></pre>
+      </div>
+      <div class="bg-white p-4 rounded shadow">
+        <h2 class="font-medium mb-2">Decoded Payload</h2>
+        <pre id="payloadJson" class="text-xs text-slate-700 h-40 overflow-auto p-2 bg-slate-50 rounded"></pre>
+      </div>
+    </section>
+
+    <section class="mb-4 bg-white p-4 rounded shadow">
+      <h2 class="font-medium mb-2">Optional Overrides</h2>
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        <input id="optId" type="text" placeholder="UUID (for vmess/vless)" class="w-full rounded border p-2 text-sm" />
+        <input id="optPassword" type="text" placeholder="Password (for trojan/ss)" class="w-full rounded border p-2 text-sm" />
+        <input id="optMethod" type="text" placeholder="Shadowsocks method (e.g. aes-256-gcm)" class="w-full rounded border p-2 text-sm" />
+        <input id="optLabel" type="text" placeholder="Label / remark" class="w-full rounded border p-2 text-sm" />
+      </div>
+    </section>
+
+    <section class="mb-6 bg-white p-4 rounded shadow">
+      <h2 class="font-medium mb-2">Protocol & Generated Links</h2>
+      <div id="protocolGuess" class="text-sm text-slate-600 mb-3"></div>
+      <div id="linksContainer" class="space-y-3"></div>
+    </section>
+
+    <footer class="text-xs text-slate-500">
+      <p>Placeholders are used for missing fields (UUID/password/etc.). Fill optional fields to override them.</p>
+    </footer>
+  </div>
+
+  <script>
+  // ----- Helpers -----
+  function cleanBridgeInput(str){
+    str = str.replace(/-----BEGIN ARGO VPN BRIDGE BLOCK-----/g, '');
+    str = str.replace(/-----END ARGO VPN BRIDGE BLOCK-----/g, '');
+    return str.replace(/\s+/g,'');
+  }
+
+  function base64ToUint8Array(b64){
+    const bin = atob(b64);
+    const arr = new Uint8Array(bin.length);
+    for(let i=0;i<bin.length;i++) arr[i] = bin.charCodeAt(i);
+    return arr;
+  }
+
+  function base64FromUtf8(str){
+    const encoder = new TextEncoder();
+    const u8 = encoder.encode(str);
+    let bin = '';
+    const chunk = 0x8000;
+    for (let i=0; i<u8.length; i+=chunk){
+      const sub = u8.subarray(i, i+chunk);
+      bin += String.fromCharCode.apply(null, sub);
+    }
+    return btoa(bin);
+  }
+
+  function utf8FromBase64(b64){
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for(let i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i);
+    return new TextDecoder().decode(bytes);
+  }
+
+  function guessProtocolLetter(letter){
+    if(!letter) return null;
+    const map={A:'vmess',V:'vless',T:'trojan',S:'shadowsocks'};
+    return map[letter.toUpperCase()]||null;
+  }
+
+  function prettyJSON(obj){try{return JSON.stringify(obj,null,2);}catch(e){return String(obj);}}
+
+  function createLinkCard(kind,link){
+    const wrapper=document.createElement('div');
+    wrapper.className='p-3 border rounded bg-slate-50';
+    const header=document.createElement('div');
+    header.className='flex items-center justify-between mb-2';
+    header.innerHTML=`<div class="font-medium text-sm">${kind}</div>`;
+    const btns=document.createElement('div');btns.className='flex gap-2';
+    const copyBtn=document.createElement('button');
+    copyBtn.className='px-2 py-1 text-xs border rounded bg-white';
+    copyBtn.textContent='Copy';
+    copyBtn.onclick=()=>{navigator.clipboard.writeText(link).then(()=>{copyBtn.textContent='Copied!'; setTimeout(()=>copyBtn.textContent='Copy',1200);});};
+    const openBtn=document.createElement('a');
+    openBtn.className='px-2 py-1 text-xs border rounded bg-white';
+    openBtn.textContent='Open'; openBtn.href=link; openBtn.target='_blank';
+    btns.appendChild(copyBtn); btns.appendChild(openBtn); header.appendChild(btns);
+    const pre=document.createElement('pre'); pre.className='text-xs break-words'; pre.textContent=link;
+    wrapper.appendChild(header); wrapper.appendChild(pre);
+    return wrapper;
+  }
+
+  // ----- Link generators -----
+  function makeVmessLink(payload, opts){
+    const vmess_json={
+      v:"2",
+      ps: opts.label||payload.ps||"vmess-generated",
+      add: payload.server||"SERVER_HERE",
+      port: String(payload.port||443),
+      id: opts.id||payload.id||"00000000-0000-0000-0000-000000000000",
+      aid: payload.aid||"0",
+      net: payload.net||"tcp",
+      type: payload.type||"none",
+      host: payload.host||"",
+      path: payload.path||"",
+      tls: (String(payload.port||443)==="443")?"tls":(payload.tls||"none")
+    };
+    return "vmess://"+base64FromUtf8(JSON.stringify(vmess_json));
+  }
+
+  function makeVlessLink(payload, opts){
+    const uuid=opts.id||payload.id||"00000000-0000-0000-0000-000000000000";
+    const host=payload.server||"SERVER_HERE";
+    const port=String(payload.port||443);
+    const q=new URLSearchParams({encryption:"none"});
+    if(port==="443") q.set("security","tls");
+    const label=encodeURIComponent(opts.label||payload.ps||"vless-generated");
+    return `vless://${uuid}@${host}:${port}?${q.toString()}#${label}`;
+  }
+
+  function makeTrojanLink(payload, opts){
+    const password=opts.password||payload.password||"PASSWORD_HERE";
+    const host=payload.server||"SERVER_HERE";
+    const port=String(payload.port||443);
+    const label=encodeURIComponent(opts.label||payload.ps||"trojan-generated");
+    return `trojan://${encodeURIComponent(password)}@${host}:${port}#${label}`;
+  }
+
+  function makeShadowsocksLink(payload, opts){
+    const method=opts.method||payload.method||"aes-256-gcm";
+    const password=opts.password||payload.password||"PASSWORD_HERE";
+    const userinfo=`${method}:${password}`;
+    const b64=btoa(unescape(encodeURIComponent(userinfo))).replace(/=*$/,'');
+    const host=payload.server||"SERVER_HERE";
+    const port=String(payload.port||8388);
+    const label=encodeURIComponent(opts.label||payload.ps||"ss-generated");
+    return `ss://${b64}@${host}:${port}#${label}`;
+  }
+
+  // ----- Main handler -----
+  document.getElementById('btnDecode').addEventListener('click', ()=>{
+    const input=document.getElementById('inputBlob').value.trim();
+    const outerJsonEl=document.getElementById('outerJson');
+    const payloadJsonEl=document.getElementById('payloadJson');
+    const protGuessEl=document.getElementById('protocolGuess');
+    const linksContainer=document.getElementById('linksContainer');
+
+    outerJsonEl.textContent=''; payloadJsonEl.textContent=''; protGuessEl.textContent=''; linksContainer.innerHTML='';
+
+    if(!input){ alert('Please paste a bridge string'); return; }
+
+    try{
+      const cleaned=cleanBridgeInput(input);
+      const arr=base64ToUint8Array(cleaned);
+      const inflated=pako.inflate(arr);
+      const text=new TextDecoder().decode(inflated);
+      let outer=JSON.parse(text);
+      outerJsonEl.textContent=prettyJSON(outer);
+
+      const payloadB64=outer.payload;
+      if(!payloadB64){ payloadJsonEl.textContent='No "payload" field inside outer JSON.'; return; }
+
+      let payloadDecodedText=null, payloadParsed=null;
+      try{ payloadDecodedText=utf8FromBase64(payloadB64); } catch(e){ payloadDecodedText=atob(payloadB64); }
+      try{ payloadParsed=JSON.parse(payloadDecodedText); } catch(e){ /* not JSON */ }
+
+      payloadJsonEl.textContent=payloadParsed?prettyJSON(payloadParsed):('Decoded payload (raw):\n'+payloadDecodedText);
+
+      const opts={
+        id: document.getElementById('optId').value.trim()||null,
+        password: document.getElementById('optPassword').value.trim()||null,
+        method: document.getElementById('optMethod').value.trim()||null,
+        label: document.getElementById('optLabel').value.trim()||null,
+        port: null
+      };
+
+      const protoLetter=(payloadParsed&&payloadParsed.protocol)?payloadParsed.protocol:(outer.protocol||null);
+      const protoName=guessProtocolLetter(protoLetter);
+      protGuessEl.innerHTML=`<strong>raw protocol:</strong> ${protoLetter||'—'} &nbsp; <strong>guess:</strong> ${protoName||'unknown'}`;
+
+      const payloadObj=payloadParsed||{ raw: payloadDecodedText };
+      const links={};
+      if(protoName==='vmess') links.vmess=makeVmessLink(payloadObj, opts);
+      else if(protoName==='vless') links.vless=makeVlessLink(payloadObj, opts);
+      else if(protoName==='trojan') links.trojan=makeTrojanLink(payloadObj, opts);
+      else if(protoName==='shadowsocks') links.shadowsocks=makeShadowsocksLink(payloadObj, opts);
+      else {
+        links.vmess=makeVmessLink(payloadObj, opts);
+        links.vless=makeVlessLink(payloadObj, opts);
+        links.trojan=makeTrojanLink(payloadObj, opts);
+        links.shadowsocks=makeShadowsocksLink(payloadObj, opts);
+      }
+
+      for(const [k,v] of Object.entries(links)) linksContainer.appendChild(createLinkCard(k,v));
+
+    } catch(err){
+      alert('Error: '+(err.message||err)); console.error(err);
+    }
+  });
+
+  document.getElementById('btnClear').addEventListener('click', ()=>{
+    ['inputBlob','outerJson','payloadJson','protocolGuess','optId','optPassword','optMethod','optLabel'].forEach(id=>document.getElementById(id).value='');
+    document.getElementById('linksContainer').innerHTML='';
+  });
+  </script>
+</body>
+</html>
